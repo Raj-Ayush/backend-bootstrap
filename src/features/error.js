@@ -8,19 +8,18 @@ const {v4: uuidv4} = require('uuid');
 
 class ApiError extends Error {
     constructor(statusCode, message, isOperational = true, stack = '') {
-        super(message);
+        super(message); // Call the parent constructor and pass the message
         this.statusCode = statusCode;
-        this.message = message;
-        this.msg = message;
         this.isOperational = isOperational;
+        this.msg = message; // Only include this if you need a separate `msg` property
+
         if (stack) {
-            this.stack = stack;
+            this.stack = stack; // Use provided stack trace if available
         } else {
-            Error.captureStackTrace(this, this.constructor);
+            Error.captureStackTrace(this, this.constructor); // Capture stack trace specific to this error class
         }
     }
 }
-
 function errorConverter(err, req, res, next) {
     let error = err;
     if (!(error instanceof ApiError)) {

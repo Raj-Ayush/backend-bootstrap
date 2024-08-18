@@ -1,154 +1,155 @@
-
-const _ = require('lodash');
+const httpStatus = require('http-status');
+const jwt = require('jsonwebtoken');
+const User = require('../models/user.model');
+const Session = require('../models/session.model');
+const {ApiError} = require('../features/error'); // Correct import
 const logger = require('../features/logger');
 const config = require('../../config/config');
-const i18nUtil = require('../services/i18n');
-const UserService = require('./user.service');
-const {generateOTP} = require('../utils/otp.util');
-const jwt = require('jsonwebtoken');
-const {ApiError} = require('../features/error');
-const httpStatus = require('http-status');
-const nodemailer = require('nodemailer');
-const bcrypt = require('bcryptjs');
-const {authentication, otpVerification} = config;
+const {v4: uuidv4} = require('uuid');
 
-// Mock database to store OTPs temporarily
-
-// Configure the email transport using nodemailer
-const transporter = nodemailer.createTransport({
-    service: 'Gmail',
-    auth: {
-        user: otpVerification.email_user, // Your email
-        pass: otpVerification.email_pass, // Your email password
-    },
-});
+const {hashPassword, comparePassword} = require('../utils/security.util');
+const {generateAccessToken, generateRefreshToken} = require('../utils/jwt.util');
 
 class AuthService {
-    // Function to send OTP via email
-    async sendOtpToEmail(body, language) {
+    async signup({email, password, firstName, lastName, dob, deviceInfo, ipAddress}) {
         try {
-            const appLanguage = _.get(language, 'en');
-            const {email} = body;
-
-            if (!email) {
-                throw new ApiError(httpStatus.BAD_REQUEST, i18nUtil.getLocaleValue('EMAIL_FORMAT_ERROR', appLanguage));
+            const existingUser = await User.findOne({where: {email}});
+            if (existingUser) {
+                throw new ApiError(httpStatus.CONFLICT, 'Email already in use');
             }
 
-            const otp = generateOTP();
-            const expireTime = 10; // Expire time in minutes
-            const otpMessage = `Your OTP for TheAstroBharat: ${otp}\n\nValid for ${expireTime} minutes. Use it to verify your email.\n\nTheAstroBharat Team`;
+            const hashedPassword = await hashPassword(password);
+            const user = await User.create({email, password: hashedPassword, firstName, lastName, dob});
+            logger.info(`User created with email: ${email}`);
 
-            // Hash the OTP
-            const hashedOtp = await hashOtp(otp);
+            const refreshToken = generateRefreshToken(user);
 
-            // Prepare user payload
-            const userPayload = {
-                hashedOtp,
-                email,
-            };
+            // Create a session ID and save the session
+            const sessionId = uuidv4(); // Create a unique session ID
+            const sessionDuration = config.session.maxDuration || 3600; // In seconds, default to 1 hour
+            const expiresAt = new Date(Date.now() + (sessionDuration * 1000));
 
-            // Check if the user already exists and is verified
-            const existingUser = await UserService.getUserByEmail(email);
-            if (existingUser && existingUser.isEmailVerified) {
-                throw new ApiError(httpStatus.CONFLICT, i18nUtil.getLocaleValue('OTP_VERIFICATION_ERROR', appLanguage));
-            }
+            await Session.create({
+                id: sessionId, // Save the session ID
+                userId: user.id,
+                deviceInfo,
+                ipAddress,
+                isActive: true,
+                expiresAt,
+            });
 
-            // Send OTP email
-            const mailOptions = {
-                from: otpVerification.email_user,
-                to: email,
-                subject: 'Your OTP Code',
-                text: otpMessage,
-            };
+            // Include sessionId in the JWT payload
+            const accessTokenWithSession = generateAccessToken({...user.toJSON(), sessionId});
 
-            const sendEmailP = transporter.sendMail(mailOptions);
-            const updateUserP = UserService.updateByEmail(email, userPayload);
-            const result = await Promise.all([sendEmailP, updateUserP]);
+            user.refreshToken = refreshToken;
+            await user.save();
 
-            // Ensure email was sent successfully
-            if (!result[0].accepted.includes(email)) {
-                throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to send OTP email.');
-            }
-
-            logger.info(`OTP sent to email: ${email}`);
-            return {message: 'OTP sent successfully!'};
+            return {accessToken: accessTokenWithSession, refreshToken, sessionId};
         } catch (err) {
-            logger.error('Error in sendOtpToEmail service:', err);
+            logger.error('Error during user signup:', err.message);
             throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, err.message);
         }
     }
 
-    // Function to verify OTP
-    async verifyOtpUser(body, language) {
+    async login(email, password, deviceInfo, ipAddress) {
         try {
-            const appLanguage = _.get(language, 'en');
-            const userDetails = await UserService.getUserByMobNumber(body.mobNumber);
-
-            if (!userDetails || !body.mobNumber) {
-                const err = new ApiError(httpStatus.NOT_FOUND, i18nUtil.getLocaleValue('PHONE_NUMBER_ERROR', appLanguage));
-                throw err;
+            const user = await User.findOne({where: {email}});
+            if (!user) {
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Invalid email or password');
             }
 
-            if (!body.phoneOtp) {
-                const err = new ApiError(httpStatus.NOT_FOUND, i18nUtil.getLocaleValue('PHONE_OTP_ERROR', appLanguage));
-                throw err;
+            if (!user.isActive) {
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Account is inactive');
             }
 
-            const isOTPValid = await compareOtp(body.phoneOtp, userDetails.hashedOtp);
-
-            if (!isOTPValid) {
-                const err = new ApiError(httpStatus.UNAUTHORIZED, {status: false, message: 'UNAUTHORIZED'});
-                throw err;
+            const isPasswordValid = await comparePassword(password, user.password);
+            if (!isPasswordValid) {
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Invalid email or password');
             }
 
-            body.isOtpVerified = true;
-            body.hashedOtp = null;
-            const updatesUserDetails = await UserService.updateByMobNumber(body.mobNumber, body);
-            // SENDING BACK TO TOKEN
-            const jwtToken = jwt.sign({mobNumber: updatesUserDetails.mobNumber}, authentication.refresh_token_secret_key, {
-                expiresIn: authentication.jwt_token_expiration,
-                algorithm: authentication.token_algortihm,
-                issuer: authentication.jwt_token_issuer,
+            const activeSessions = await Session.count({where: {userId: user.id, isActive: true}});
+            const maxDevices = config.session.maxDevices || 3;
+
+            if (activeSessions >= maxDevices) {
+                throw new ApiError(httpStatus.FORBIDDEN, 'Maximum number of devices logged in');
+            }
+
+            const sessionId = uuidv4();
+            const sessionDuration = config.session.maxDuration || 3600;
+            const expiresAt = new Date(Date.now() + (sessionDuration * 1000));
+
+            await Session.create({
+                id: sessionId,
+                userId: user.id,
+                deviceInfo,
+                ipAddress,
+                isActive: true,
+                expiresAt,
             });
-            const refreshToken = jwt.sign({_id: updatesUserDetails._id}, authentication.jwt_token_secret_key, {
-                expiresIn: authentication.refresh_token_expiration,
-                algorithm: authentication.token_algortihm,
-                issuer: authentication.refresh_token_issuer,
-            });
-            const responsePayload = {
-                message: 'SUCCESS',
-                status: true,
-                usersInfo: {
-                    phoneNumber: updatesUserDetails.phoneNumber,
-                    isOtpVerified: updatesUserDetails.isOtpVerified,
-                    role: body.role || 'CUSTOMER',
-                    id: updatesUserDetails._id,
-                },
-                accessToken: {
-                    token: jwtToken,
-                    expiresIn: authentication.jwt_token_expiration,
-                },
-                refreshToken: {
-                    token: refreshToken,
-                    expireIn: authentication.refresh_token_expiration,
-                },
-            };
-            return responsePayload;
+
+            const accessTokenWithSession = generateAccessToken({...user.toJSON(), sessionId});
+            const refreshToken = generateRefreshToken({...user.toJSON(), sessionId});
+
+            user.refreshToken = refreshToken;
+            await user.save();
+
+            return {accessToken: accessTokenWithSession, refreshToken, sessionId};
         } catch (err) {
-            logger.error(err);
-            throw err;
+            logger.error('Error during user login:', err);
+            throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to log in');
+        }
+    }
+
+    async refresh(refreshToken, deviceInfo, ipAddress) {
+        try {
+            const decoded = jwt.verify(refreshToken, config.authentication.refresh_token_secret_key);
+            const user = await User.findOne({where: {id: decoded.id, refreshToken, isActive: true}});
+            if (!user) {
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Invalid refresh token');
+            }
+
+            // Verify if the session is still active
+            const session = await Session.findOne({where: {id: decoded.sessionId, isActive: true}});
+            if (!session) {
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Session expired or invalid');
+            }
+
+            const accessTokenWithSession = generateAccessToken({...user.toJSON(), sessionId: decoded.sessionId});
+
+            logger.info(`User refreshed token from IP: ${ipAddress}, Device: ${deviceInfo}`);
+
+            return {accessToken: accessTokenWithSession};
+        } catch (err) {
+            if (err instanceof jwt.TokenExpiredError) {
+                logger.warn('Refresh token expired:', err.message);
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Refresh token expired');
+            } else if (err instanceof jwt.JsonWebTokenError) {
+                logger.warn('Invalid refresh token:', err.message);
+                throw new ApiError(httpStatus.UNAUTHORIZED, 'Invalid refresh token');
+            }
+
+            logger.error('Error during token refresh:', err.message);
+            throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to refresh token');
+        }
+    }
+
+    async logout(userId) {
+        try {
+            const user = await User.findByPk(userId);
+            if (!user) {
+                throw new ApiError(httpStatus.NOT_FOUND, 'User not found');
+            }
+
+            user.refreshToken = null;
+            await user.save();
+
+            await Session.update({isActive: false}, {where: {userId}});
+            logger.info(`User with ID ${userId} logged out successfully`);
+        } catch (err) {
+            logger.error('Error during user logout:', err.message);
+            throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, 'Failed to log out');
         }
     }
 }
-
-const hashOtp = async function (otp) {
-    const saltRounds = await bcrypt.genSalt(config.authentication.salt);
-    const hashedOtp = await bcrypt.hashSync(otp, saltRounds);
-    return hashedOtp;
-};
-
-const compareOtp = async function (otp, hashedOtp) {
-    return bcrypt.compareSync(otp, hashedOtp);
-};
 
 module.exports = new AuthService();

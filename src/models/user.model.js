@@ -1,140 +1,63 @@
-const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-const {Schema} = mongoose;
-const utils = require('../utils/utils');
-const {toJSON, paginate} = require('./plugins');
+const {DataTypes} = require('sequelize');
+const {sequelize} = require('../connection/db');
 
-const userSchema = new Schema(
-    {
-        _id: {
-            type: String,
-        },
-        firstName: {
-            type: String,
-            trim: true,
-            maxlength: 200,
-        },
-        lastName: {
-            type: String,
-            trim: true,
-            maxlength: 200,
-        },
-        lname: {
-            type: String,
-            lowercase: true,
-        },
-        phoneNumber: {
-            countryCode: {
-                type: String,
-                required: false,
-            },
-            number: {
-                type: String,
-                required: false,
-                trim: true,
-                unique: true,
-            },
-            required: false,
-        },
-        email: {
-            type: String,
-            required: true,
-            unique: true, // Ensure email uniqueness
-            trim: true,
-            lowercase: true,
-            match: [/^\S+@\S+\.\S+$/, 'Please enter a valid email address.'], // Email format validation
-        },
-        hashedOtp: {
-            type: String,
-        },
-        password: {
-            type: String,
-            required: true,
-            minlength: 8, // Ensure password has a minimum length
-        },
-        dob: {
-            type: Date,
-            required: true,
-            validate: {
-                validator(value) {
-                    // Validate DOB to ensure the user is at least 18 years old
-                    const today = new Date();
-                    const age = today.getFullYear() - value.getFullYear();
-                    if (
-                        age > 18
-            || (age === 18
-              && today.getMonth() >= value.getMonth()
-              && today.getDate() >= value.getDate())
-                    ) {
-                        return true;
-                    }
-
-                    return false;
-                },
-                message: 'User must be at least 18 years old.',
-            },
-        },
-        isActive: {
-            type: Boolean,
-            default: true,
-        },
-        isOtpVerified: {
-            type: Boolean,
-            default: false,
-        },
-        description: {
-            type: String,
-            trim: true,
-        },
-        role: {
-            type: String,
-            enum: ['PERSONAL', 'BUSINESS'],
-        },
-        mobNumber: {
-            type: String,
+const User = sequelize.define('User', {
+    id: {
+        type: DataTypes.UUID,
+        defaultValue: DataTypes.UUIDV4,
+        primaryKey: true,
+    },
+    email: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        unique: true,
+        validate: {
+            isEmail: true,
         },
     },
-    {
-        timestamps: true,
-        versionKey: false,
+    password: {
+        type: DataTypes.STRING,
+        allowNull: false,
     },
-);
-
-// Add plugin that converts mongoose to json
-userSchema.plugin(toJSON);
-userSchema.plugin(paginate);
-
-// Pre-save hook to hash password before saving user
-userSchema.pre('save', async function (next) {
-    const user = this;
-
-    // Generate UUID if _id is not present
-    if (!user._id) {
-        user._id = await utils.uuid('u-');
-    }
-
-    // Hash password if it has been modified or is new
-    if (user.isModified('password')) {
-        const saltRounds = 10;
-        user.password = await bcrypt.hash(user.password, saltRounds);
-    }
-
-    next();
+    firstName: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        validate: {
+            len: [2, 100], // Validate length between 2 and 100 characters
+        },
+    },
+    lastName: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        validate: {
+            len: [2, 100], // Validate length between 2 and 100 characters
+        },
+    },
+    dob: {
+        type: DataTypes.DATE,
+        allowNull: false,
+        validate: {
+            isDate: true, // Ensure it's a valid date
+            isOldEnough(value) {
+                const today = new Date();
+                const age = today.getFullYear() - value.getFullYear();
+                if (age < 18) {
+                    throw new Error('User must be at least 18 years old.');
+                }
+            },
+        },
+    },
+    isActive: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: true,
+    },
+    refreshToken: {
+        type: DataTypes.TEXT,
+        allowNull: true,
+    },
+}, {
+    timestamps: true,
+    tableName: 'Users',
 });
-
-/**
- * Method to compare input password with hashed password
- * @param {string} password
- * @returns {Promise<boolean>}
- */
-userSchema.methods.isPasswordMatch = async function (password) {
-    const user = this;
-    return bcrypt.compare(password, user.password);
-};
-
-/**
- * @typedef User
- */
-const User = mongoose.model('User', userSchema);
 
 module.exports = User;
